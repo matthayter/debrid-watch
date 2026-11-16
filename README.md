@@ -1,0 +1,127 @@
+# debrid-watch
+
+A small personal web server that watches an [AllDebrid](https://alldebrid.com) account for newly added magnets, lists the files in each one, and works out where each file should be downloaded to (TV / movies / other). Sending those files to an [aria2](https://aria2.github.io/) instance to download is the next planned step (see `HANDOFF.md`).
+
+Everything is held in memory. Restarting the server clears the settings, cached file lists and name overrides.
+
+## Running
+
+```sh
+nix develop            # dev shell with rustc and cargo (see flake.nix)
+cargo run              # serves http://127.0.0.1:3000
+```
+
+Set the AllDebrid API key on the Settings page, or pass it at startup:
+
+```sh
+set -a; . ./.env; set +a   # .env (gitignored) contains ALLDEBRID_API_KEY=...
+cargo run
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ALLDEBRID_API_KEY` | unset | Starting API key. It's checked at startup but kept even if the check fails. |
+| `DEBRID_WATCH_ADDR` | `127.0.0.1:3000` | Address to listen on. |
+| `DEBRID_WATCH_DEST_PREFIX` | `/downloads` | Root folder for destinations. It can also be changed on the Settings page. |
+| `DEBRID_WATCH_SINCE` | startup time | Unix time from which magnets count as "new". `0` shows every magnet on the account, which is handy for testing. |
+| `RUST_LOG` | `info` | Log level (`env_logger`). |
+
+The server has no authentication. Only bind it to a non-local address on a network you trust.
+
+## Architecture
+
+The code is all synchronous Rust, with no async runtime. The app is for one user with very little traffic, so plain threads are simpler and fast enough.
+
+| Crate | Role |
+|---|---|
+| `rouille` | HTTP server. Runs each request on a thread from a pool. |
+| `ureq` | Blocking HTTP client (rustls) for the AllDebrid API. |
+| `askama` | HTML templates in `templates/`, compiled into the binary and checked at build time. |
+| `regex` | Name parsing in `media.rs`. |
+| `serde` | JSON (AllDebrid responses) and forms. |
+
+### Modules
+
+```
+src/
+  main.rs       startup, env vars, shared AppState
+  alldebrid.rs  AllDebrid API client and response types
+  media.rs      file classification: works out each file's destination (pure, no I/O)
+  web.rs        routes, handlers, and the view data handed to templates
+templates/
+  base.html     layout, nav and all CSS (light/dark)
+  home.html     new magnets, their files and destinations
+  settings.html API key and destination prefix
+```
+
+#### `main.rs`: state
+
+`AppState` is created once and shared with every request through an `Arc`:
+
+- `settings: Mutex<Settings>`: the API key, the AllDebrid username and the destination prefix.
+- `since: i64`: magnets with `uploadDate >= since` count as new.
+- `files: Mutex<HashMap<magnet id, Vec<MagnetFile>>>`: the file-list cache. Each ready magnet's list is fetched only once.
+- `name_overrides: Mutex<HashMap<magnet id, String>>`: show names or movie titles set by the user.
+
+The locks are held briefly, and never during an HTTP call to AllDebrid. A poisoned lock is recovered rather than unwrapped, since a half-finished update can't leave this state inconsistent.
+
+#### `alldebrid.rs`: API client
+
+The client uses `Authorization: Bearer <key>` auth. Every response is wrapped in `{"status": "success", "data": ...}` or `{"status": "error", "error": {code, message}}`, and the client turns that into `Result<T, Error>`. Because AllDebrid puts errors in the JSON body, the HTTP status code isn't treated as an error by itself.
+
+| Method | Endpoint | Used for |
+|---|---|---|
+| `user()` | `GET /v4/user` | Checking an API key and getting the username. |
+| `magnets()` | `POST /v4.1/magnet/status` | Listing every magnet with its status and dates. |
+| `magnet_files()` | `POST /v4/magnet/files` with form `id[]=…` | File trees for several magnets in one call. |
+
+`magnet_files` flattens AllDebrid's tree (`n` name, `s` size, `l` link, `e` children) into `MagnetFile { path: "dir/sub/file.ext", size, link }`. The `link` values are AllDebrid links that must be unlocked before aria2 can download them; that isn't done yet. The `magnet/files` endpoint returns IDs as strings, and the client accepts strings or numbers.
+
+#### `media.rs`: classification
+
+`classify(magnet_name, files, prefix, name_override) -> Classification { kind, detected_name, files: Vec<PlannedFile> }`. Each `PlannedFile` gets a `Decision`: either `Include { dest_dir, file_name }` or `Exclude { reason }`.
+
+1. **File facts.** Each file's extension decides its type (video, subtitle or other). A video is a *sample* if its name contains the word "sample" or it sits in a `Sample/` folder. An episode is found by looking for `S01E02` or `1x02` in the file name, then in each parent folder from the innermost out.
+2. **Kind.**
+   - **TV:** at least one non-sample video has an episode number.
+   - **Movie:** non-sample videos, but none with an episode number.
+   - **Other:** everything else.
+3. **Destinations.**
+   - **TV:** `{prefix}/tv/{Show}/Season_{NN}/{file}`.
+     - The show name is the text before the episode number. If that's empty, it comes from the folder names, then from the magnet name.
+     - The season comes from each file, so multi-season packs are split.
+     - A subtitle whose episode number came from its folder is renamed `{folder}.{file}`, so files don't overwrite each other.
+     - A subtitle with no episode number goes to the season folder if the pack has one season, and is excluded otherwise.
+     - Videos that aren't episodes (extras), samples and other files are excluded.
+   - **Movie:** `{prefix}/movies/{Title (Year)}/{file}`.
+     - The title comes from the magnet name, or else the largest video. It's cut at release info (`1080p`, `BluRay`, `x265` and so on), and the last year before that cut is kept.
+     - Videos and subtitles are put in one folder, flattened. If two files have the same name, the second gets its parent folder name as a prefix.
+     - Samples and other files are excluded.
+   - **Other:** `{prefix}/other/{original path}`. Nothing is excluded.
+4. **Name cleanup.** Leading `[Group]` tags and `www.site.org - ` prefixes are removed, and `.` and `_` become spaces. A trailing year becomes `(YYYY)`. User overrides are cleaned by `clean_name_override` so they're safe as one folder name.
+
+Everything in this module is a pure function covered by unit tests, many of them based on real release names. When changing the rules, add a test case for the release that prompted it.
+
+#### `web.rs`: request flow
+
+Routes: `GET /`, `GET /settings`, `POST /settings` (with `action` set to `save_key`, `remove_key` or `save_prefix`), and `POST /magnets/{id}/name` (with `action` set to `save` or `reset`). Every POST redirects afterwards (303), so reloading a page never re-submits a form.
+
+`GET /` works like this:
+
+1. Read the API key and prefix from the settings, then release the lock.
+2. `magnets()`: keep those added since `since`, newest first.
+3. `fetch_missing_files()`: for ready magnets (`statusCode == 4`) not in the cache, call `magnet_files()` in batches of 50 and cache the results. Errors for individual magnets are shown on their cards and retried on the next load.
+4. For each magnet, run `media::classify` with the cached files, the prefix and any name override, then build the `MagnetCard` view data for `home.html`.
+
+Classification runs again on every render (it's cheap), so a change to the prefix or a name takes effect straight away. Once file lists are cached, a page load makes one AllDebrid request, plus one more if new magnets have become ready.
+
+## Testing
+
+```sh
+cargo test                  # offline unit tests (parsing, classification, formatting)
+cargo test -- --ignored     # live AllDebrid tests; needs ALLDEBRID_API_KEY
+```
+
+The live tests are meant to be run by hand, to stay well under AllDebrid's rate limits (12 requests per second, 600 per minute). For checking the UI against real data, run with `DEBRID_WATCH_SINCE=0`.
