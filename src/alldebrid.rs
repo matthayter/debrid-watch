@@ -202,6 +202,38 @@ mod tests {
         assert_eq!(data.magnets.into_vec()[0].filename, "a");
     }
 
+    /// Key for the live tests below, which call the real AllDebrid API.
+    /// Run them with `ALLDEBRID_API_KEY=... cargo test -- --ignored`.
+    fn live_api_key() -> String {
+        std::env::var("ALLDEBRID_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .expect("set ALLDEBRID_API_KEY to run live tests")
+    }
+
+    #[test]
+    #[ignore = "calls the real AllDebrid API; needs ALLDEBRID_API_KEY"]
+    fn live_user() {
+        let user = Client::new().user(&live_api_key()).unwrap();
+        assert!(!user.username.is_empty());
+    }
+
+    #[test]
+    #[ignore = "calls the real AllDebrid API; needs ALLDEBRID_API_KEY"]
+    fn live_magnets() {
+        let magnets = Client::new().magnets(&live_api_key()).unwrap();
+        println!("{} magnets on account", magnets.len());
+    }
+
+    #[test]
+    #[ignore = "calls the real AllDebrid API"]
+    fn live_bad_key_is_rejected() {
+        match Client::new().user("not-a-real-key") {
+            Err(Error::Api(e)) => assert_eq!(e.code, "AUTH_BAD_APIKEY"),
+            other => panic!("expected AUTH_BAD_APIKEY, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_error() {
         let body = r#"{"status":"error","error":{"code":"AUTH_BAD_APIKEY","message":"The auth apikey is invalid"}}"#;
