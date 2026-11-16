@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block title %}Home{% endblock %}
+{% block nav_home %}class="active"{% endblock %}
+
+{% block content %}
+<h1>Latest magnets</h1>
+
+{% if !has_api_key %}
+  <div class="card">
+    No AllDebrid API key is set. <a href="/settings">Add one in Settings</a> to see your magnets.
+  </div>
+{% else %}
+  {% if let Some(error) = error %}
+    <div class="notice error">Could not load magnets: {{ error }}</div>
+  {% else if magnets.is_empty() %}
+    <div class="card muted">There are no magnets on this AllDebrid account.</div>
+  {% else %}
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>Name</th><th class="num">Size</th><th>Status</th><th class="num">Added</th></tr>
+        </thead>
+        <tbody>
+          {% for m in magnets %}
+          <tr>
+            <td class="name">{{ m.filename }}</td>
+            <td class="num">{{ m.size }}</td>
+            <td><span class="status {{ m.status_class }}">{{ m.status }}</span></td>
+            <td class="num muted">{{ m.added }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}

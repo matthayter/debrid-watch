@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}Settings{% endblock %}
+{% block nav_settings %}class="active"{% endblock %}
+
+{% block content %}
+<h1>Settings</h1>
+
+{% if let Some(error) = error %}
+  <div class="notice error">{{ error }}</div>
+{% else if saved %}
+  <div class="notice ok">Settings saved.</div>
+{% endif %}
+
+<form method="post" action="/settings" class="card">
+  <label for="alldebrid_api_key">AllDebrid API key</label>
+  <input type="password" id="alldebrid_api_key" name="alldebrid_api_key"
+         autocomplete="off" placeholder="{% if let Some(k) = masked_key %}{{ k }}{% else %}Paste your API key{% endif %}">
+  <div class="hint">
+    {% if let Some(k) = masked_key %}
+      Current key: {{ k }}{% if let Some(u) = username %} (account: {{ u }}){% endif %}.
+    {% else %}
+      No key set. Create one at <a href="https://alldebrid.com/apikeys/" target="_blank" rel="noopener">alldebrid.com/apikeys</a>.
+    {% endif %}
+    Settings are kept in memory and are lost when the server restarts.
+  </div>
+  <button type="submit" name="action" value="save">Save</button>
+  {% if masked_key.is_some() %}
+    <button type="submit" name="action" value="remove" class="secondary" formnovalidate>Remove key</button>
+  {% endif %}
+</form>
+{% endblock %}
