@@ -4,35 +4,84 @@
 {% block nav_home %}class="active"{% endblock %}
 
 {% block content %}
-<h1>Latest magnets</h1>
+<h1>New magnets</h1>
 
 {% if !has_api_key %}
   <div class="card">
     No AllDebrid API key is set. <a href="/settings">Add one in Settings</a> to see your magnets.
   </div>
+{% else if let Some(error) = error %}
+  <div class="notice error">Could not load magnets: {{ error }}</div>
+{% else if magnets.is_empty() %}
+  <div class="card muted">No new magnets yet (watching since {{ since_ago }}). Reload this page to check again.</div>
 {% else %}
-  {% if let Some(error) = error %}
-    <div class="notice error">Could not load magnets: {{ error }}</div>
-  {% else if magnets.is_empty() %}
-    <div class="card muted">There are no magnets on this AllDebrid account.</div>
-  {% else %}
-    <div class="card">
-      <table>
+  <p class="muted">Magnets added since watching started ({{ since_ago }}), newest first.</p>
+  {% for m in magnets %}
+  <section class="card magnet" id="magnet-{{ m.id }}">
+    <div class="magnet-head">
+      <h2>{{ m.name }}</h2>
+      {% if let Some(kind) = m.kind %}<span class="badge">{{ kind }}</span>{% endif %}
+    </div>
+    <div class="meta muted">
+      {{ m.size }} · added {{ m.added }} ·
+      <span class="status {{ m.status_class }}">{{ m.status }}</span>
+    </div>
+
+    {% if !m.ready %}
+      {% if m.status_class == "error" %}
+        <div class="notice error">AllDebrid could not download this magnet: {{ m.status }}</div>
+      {% else %}
+        <div class="notice pending">Not ready for processing yet: AllDebrid is still working on it ({{ m.status }}).</div>
+      {% endif %}
+    {% else if let Some(error) = m.files_error %}
+      <div class="notice error">Could not load the file list: {{ error }}</div>
+    {% else %}
+      {% if let Some(n) = m.media_name %}
+        <form method="post" action="/magnets/{{ m.id }}/name" class="name-form">
+          <label for="name-{{ m.id }}">{{ n.label }}</label>
+          <div class="name-row">
+            <input type="text" id="name-{{ m.id }}" name="name" value="{{ n.current }}" required>
+            <button type="submit" name="action" value="save">Save</button>
+            {% if n.overridden %}
+              <button type="submit" name="action" value="reset" class="secondary" formnovalidate>Reset</button>
+            {% endif %}
+          </div>
+          {% if n.overridden %}<div class="hint">Changed by you. Detected as <code>{{ n.detected }}</code>.</div>{% endif %}
+        </form>
+      {% endif %}
+      {% if !m.destinations.is_empty() %}
+        <div class="dests">
+          Destination{% if m.destinations.len() > 1 %}s{% endif %}:
+          {% for d in m.destinations %}<code>{{ d }}</code>{% endfor %}
+        </div>
+      {% endif %}
+      <table class="files">
         <thead>
-          <tr><th>Name</th><th class="num">Size</th><th>Status</th><th class="num">Added</th></tr>
+          <tr><th>File</th><th class="num">Size</th><th>Destination</th></tr>
         </thead>
         <tbody>
-          {% for m in magnets %}
-          <tr>
-            <td class="name">{{ m.filename }}</td>
-            <td class="num">{{ m.size }}</td>
-            <td><span class="status {{ m.status_class }}">{{ m.status }}</span></td>
-            <td class="num muted">{{ m.added }}</td>
+          {% for f in m.files %}
+          {% if let Some(reason) = f.excluded %}
+          <tr class="excluded">
+            <td class="name">{{ f.path }}</td>
+            <td class="num">{{ f.size }}</td>
+            <td>Excluded: {{ reason }}</td>
           </tr>
+          {% else %}
+          <tr>
+            <td class="name">{{ f.path }}</td>
+            <td class="num">{{ f.size }}</td>
+            <td class="name">
+              {% if let Some(dir) = f.dest_dir %}<code>{{ dir }}/</code>{% endif %}
+              {% if let Some(new_name) = f.renamed_to %}<div class="rename">saved as <code>{{ new_name }}</code></div>{% endif %}
+            </td>
+          </tr>
+          {% endif %}
           {% endfor %}
         </tbody>
       </table>
-    </div>
-  {% endif %}
+    {% endif %}
+  </section>
+  {% endfor %}
 {% endif %}
 {% endblock %}

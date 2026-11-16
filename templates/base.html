@@ -50,6 +50,27 @@
              background: var(--accent); color: #fff; cursor: pointer; }
     button.secondary { background: transparent; color: var(--err); border: 1px solid var(--border); margin-left: 8px; }
     .hint { font-size: 13px; color: var(--muted); margin-top: 6px; }
+    form.card + form.card { margin-top: 16px; }
+    code { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+    .notice.pending { color: var(--warn); border-color: var(--warn); }
+    .magnet { margin-bottom: 16px; }
+    .magnet .notice { margin: 12px 0 0; }
+    .magnet-head { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; }
+    .magnet-head h2 { font-size: 16px; margin: 0; word-break: break-all; }
+    .badge { font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+             border: 1px solid var(--accent); color: var(--accent); white-space: nowrap; }
+    .meta { font-size: 13px; margin-top: 4px; }
+    .dests { margin: 12px 0 4px; font-size: 13px; }
+    .dests code { display: inline-block; margin: 2px 6px 2px 0; }
+    table.files { font-size: 13px; margin-top: 8px; }
+    tr.excluded td { color: var(--muted); text-decoration: line-through; }
+    tr.excluded td:last-child { text-decoration: none; font-style: italic; }
+    .rename { color: var(--muted); margin-top: 2px; }
+    .name-form { margin-top: 12px; }
+    .name-form label { font-size: 13px; }
+    .name-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .name-row input { flex: 1 1 240px; width: auto; }
+    .name-row button { margin: 0; }
   </style>
 </head>
 <body>

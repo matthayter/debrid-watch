@@ -4,7 +4,13 @@ A small personal web server in Rust that shows magnets from an AllDebrid account
 
 - Synchronous code only, with no tokio or async: rouille (server), ureq (HTTP client), askama (templates in `templates/`).
 - `src/alldebrid.rs`: AllDebrid API client. `src/web.rs`: routes and handlers. `src/main.rs`: startup and shared state.
-- Env vars: `ALLDEBRID_API_KEY` (optional starting key), `DEBRID_WATCH_ADDR` (default `127.0.0.1:3000`).
+- `src/media.rs`: decides each file's destination (TV / movie / other) from file and folder names. Pure functions, unit-tested.
+- The home page shows magnets added since startup. File lists are fetched once per ready magnet and cached in memory. Users can override the detected show name or movie title per magnet (also in memory).
+- Env vars:
+  - `ALLDEBRID_API_KEY`: optional starting key.
+  - `DEBRID_WATCH_ADDR`: default `127.0.0.1:3000`.
+  - `DEBRID_WATCH_DEST_PREFIX`: default `/downloads`.
+  - `DEBRID_WATCH_SINCE`: unix time to count magnets as new from; defaults to startup. `0` shows every existing magnet, which is useful for testing.
 - `.env` (gitignored) holds the real API key. Load it with `set -a; . ./.env; set +a` and never print it.
 
 ## Testing

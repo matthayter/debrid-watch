@@ -22,11 +22,22 @@
     {% else %}
       No key set. Create one at <a href="https://alldebrid.com/apikeys/" target="_blank" rel="noopener">alldebrid.com/apikeys</a>.
     {% endif %}
-    Settings are kept in memory and are lost when the server restarts.
   </div>
-  <button type="submit" name="action" value="save">Save</button>
+  <button type="submit" name="action" value="save_key">Save key</button>
   {% if masked_key.is_some() %}
-    <button type="submit" name="action" value="remove" class="secondary" formnovalidate>Remove key</button>
+    <button type="submit" name="action" value="remove_key" class="secondary">Remove key</button>
   {% endif %}
 </form>
+
+<form method="post" action="/settings" class="card">
+  <label for="dest_prefix">Download destination prefix</label>
+  <input type="text" id="dest_prefix" name="dest_prefix" value="{{ dest_prefix }}">
+  <div class="hint">
+    Folder on the download machine. Files go to <code>{{ dest_prefix }}/tv/…</code>,
+    <code>{{ dest_prefix }}/movies/…</code> or <code>{{ dest_prefix }}/other/…</code>.
+  </div>
+  <button type="submit" name="action" value="save_prefix">Save prefix</button>
+</form>
+
+<p class="hint">Settings are kept in memory and are lost when the server restarts.</p>
 {% endblock %}

@@ -48,6 +48,24 @@ impl Client {
         let data: MagnetsData = parse(response)?;
         Ok(data.magnets.into_vec())
     }
+
+    /// Fetches the file lists of several magnets in one request. Each magnet
+    /// gets its own result, since AllDebrid can fail individual IDs.
+    pub fn magnet_files(
+        &self,
+        api_key: &str,
+        ids: &[u64],
+    ) -> Result<Vec<(u64, Result<Vec<MagnetFile>, ApiError>)>, Error> {
+        let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
+        let form = ids.iter().map(|id| ("id[]", id.as_str()));
+        let response = self
+            .agent
+            .post(format!("{BASE_URL}/v4/magnet/files"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .send_form(form)?;
+        let data: FilesData = parse(response)?;
+        Ok(data.magnets.into_iter().map(FilesEntry::into_result).collect())
+    }
 }
 
 fn parse<T: DeserializeOwned>(mut response: ureq::http::Response<ureq::Body>) -> Result<T, Error> {
@@ -154,6 +172,94 @@ impl Magnet {
     }
 }
 
+/// One file inside a magnet, with its folder path flattened.
+#[derive(Debug, Clone)]
+pub struct MagnetFile {
+    /// Path inside the torrent, `/`-separated, e.g. `Movie/Subs/English.srt`.
+    pub path: String,
+    pub size: u64,
+    /// AllDebrid link for the file. It must be unlocked before it can be downloaded.
+    pub link: String,
+}
+
+#[derive(Deserialize)]
+struct FilesData {
+    magnets: Vec<FilesEntry>,
+}
+
+#[derive(Deserialize)]
+struct FilesEntry {
+    #[serde(deserialize_with = "id_from_string_or_number")]
+    id: u64,
+    #[serde(default)]
+    files: Option<Vec<FileNode>>,
+    #[serde(default)]
+    error: Option<ApiError>,
+}
+
+impl FilesEntry {
+    fn into_result(self) -> (u64, Result<Vec<MagnetFile>, ApiError>) {
+        let result = match (self.files, self.error) {
+            (_, Some(error)) => Err(error),
+            (Some(nodes), None) => {
+                let mut files = Vec::new();
+                flatten(&nodes, "", &mut files);
+                Ok(files)
+            }
+            (None, None) => Err(ApiError {
+                code: "NO_FILES".to_string(),
+                message: "AllDebrid returned no file list".to_string(),
+            }),
+        };
+        (self.id, result)
+    }
+}
+
+/// A node in AllDebrid's file tree: a folder has `e` (entries), a file has
+/// `s` (size) and `l` (link).
+#[derive(Deserialize)]
+struct FileNode {
+    n: String,
+    #[serde(default)]
+    s: u64,
+    #[serde(default)]
+    l: Option<String>,
+    #[serde(default)]
+    e: Option<Vec<FileNode>>,
+}
+
+fn flatten(nodes: &[FileNode], parent: &str, out: &mut Vec<MagnetFile>) {
+    for node in nodes {
+        let path = if parent.is_empty() {
+            node.n.clone()
+        } else {
+            format!("{parent}/{}", node.n)
+        };
+        match &node.e {
+            Some(children) => flatten(children, &path, out),
+            None => out.push(MagnetFile {
+                path,
+                size: node.s,
+                link: node.l.clone().unwrap_or_default(),
+            }),
+        }
+    }
+}
+
+/// `magnet/files` returns IDs as strings while `magnet/status` uses numbers.
+fn id_from_string_or_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Number(u64),
+        String(String),
+    }
+    match Id::deserialize(d)? {
+        Id::Number(n) => Ok(n),
+        Id::String(s) => s.parse().map_err(serde::de::Error::custom),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +338,34 @@ mod tests {
             Err(Error::Api(e)) => assert_eq!(e.code, "AUTH_BAD_APIKEY"),
             other => panic!("expected AUTH_BAD_APIKEY, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_magnet_files() {
+        let body = r#"{"status":"success","data":{"magnets":[
+            {"id":"854266520","files":[{"n":"Moana 2016","e":[
+                {"n":"Moana 2016.mkv","s":2900037817,"l":"https://alldebrid.com/f/a"},
+                {"n":"Subs","e":[{"n":"English.srt","s":84899,"l":"https://alldebrid.com/f/b"}]}
+            ]}]},
+            {"id":"2","files":[{"n":"single.mkv","s":10,"l":"https://alldebrid.com/f/c"}]},
+            {"id":"3","error":{"code":"MAGNET_INVALID_ID","message":"This magnet ID does not exists or is invalid"}}
+        ]}}"#;
+        let env: Envelope<FilesData> = serde_json::from_str(body).unwrap();
+        let Envelope::Success { data } = env else {
+            panic!("expected success")
+        };
+        let results: Vec<_> = data.magnets.into_iter().map(FilesEntry::into_result).collect();
+
+        let (id, files) = &results[0];
+        assert_eq!(*id, 854266520);
+        let files = files.as_ref().unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["Moana 2016/Moana 2016.mkv", "Moana 2016/Subs/English.srt"]);
+        assert_eq!(files[0].size, 2900037817);
+        assert_eq!(files[1].link, "https://alldebrid.com/f/b");
+
+        assert_eq!(results[1].1.as_ref().unwrap()[0].path, "single.mkv");
+        assert_eq!(results[2].1.as_ref().unwrap_err().code, "MAGNET_INVALID_ID");
     }
 
     #[test]
