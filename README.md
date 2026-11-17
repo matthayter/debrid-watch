@@ -32,6 +32,34 @@ cargo run
 
 The server has no authentication. Only bind it to a non-local address on a network you trust.
 
+### NixOS
+
+The flake provides a package (`nix build`, `nix run`) and a NixOS module. Add the flake as an input, then:
+
+```nix
+# flake.nix:   inputs.debrid-watch.url = "github:<owner>/debrid-watch";
+# in modules:  debrid-watch.nixosModules.default
+services.debrid-watch = {
+  enable = true;
+  listenAddress = "127.0.0.1:3000";               # default
+  destPrefix = "/srv/media";                      # optional, as aria2 sees it
+  aria2Url = "http://127.0.0.1:6800/jsonrpc";     # optional
+  since = null;                                   # optional unix time; null = service start
+  environmentFile = "/run/secrets/debrid-watch.env";
+};
+```
+
+Secrets go in `environmentFile`, never in Nix options, because anything in the Nix config ends up in the world-readable `/nix/store`. Its contents look like this:
+
+```sh
+ALLDEBRID_API_KEY=...
+DEBRID_WATCH_ARIA2_SECRET=...
+```
+
+systemd reads it as root, so make it `root:root` with mode `0600`, or let sops-nix or agenix create it. Give the path as a string, not a Nix path literal, or Nix will copy the file into the store.
+
+The service runs as a sandboxed dynamic user with no write access to the filesystem. That's fine because aria2 writes the downloads. Because state is in memory, every restart (including some `nixos-rebuild switch` runs) clears what was sent, and with `since = null` it also hides magnets added while the service was down.
+
 ## Architecture
 
 The code is all synchronous Rust, with no async runtime. The app is for one user with very little traffic, so plain threads are simpler and fast enough.

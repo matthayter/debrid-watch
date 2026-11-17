@@ -4,6 +4,7 @@ A small personal web server in Rust that shows magnets from an AllDebrid account
 
 - Synchronous code only, with no tokio or async: rouille (server), ureq (HTTP client), askama (templates in `templates/`).
 - `src/alldebrid.rs`: AllDebrid API client. `src/aria2.rs`: aria2 JSON-RPC client. `src/web.rs`: routes and handlers. `src/main.rs`: startup and shared state.
+- `flake.nix`: package and dev shell; `nix/module.nix`: NixOS module (`services.debrid-watch`). Flakes only see git-tracked files, so `git add` new files before `nix build`.
 - `src/media.rs`: decides each file's destination (TV / movie / other) from file and folder names. Pure functions, unit-tested.
 - The home page shows magnets added since startup. File lists are fetched once per ready magnet and cached in memory. Users can override the detected show name or movie title per magnet (also in memory). A Send button unlocks the included files' links and adds them to aria2; what was sent is recorded in memory so it isn't sent twice.
 - Env vars:
