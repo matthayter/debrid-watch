@@ -20,7 +20,7 @@ Checked by hand against the live API and a local aria2 1.37.0: a one-file TV mag
 - **No re-send.** Once sent, there's no button to send again, even if the downloads were removed from aria2 or failed. Restarting the server clears the record (and with `DEBRID_WATCH_SINCE` set, re-shows the button).
 - **Sent destinations are frozen.** A sent card shows the classification as sent, and the name form is hidden. Changing the prefix afterwards doesn't change what's shown for it.
 - **Gone from aria2.** A GID aria2 no longer knows (after `forceRemove`, a restart, or `max-download-result` trimming) shows as "No longer in aria2".
-- **Slow sends block the request.** Unlocks are spaced 100 ms apart, so a 50-file pack takes several seconds before the page redirects. A delayed link can add up to a minute.
+- **Slow sends run in the background.** Unlocks are spaced 100 ms apart, so a 50-file pack takes several seconds, and a delayed link can add up to a minute. The Send button posts with `fetch`, so the page stays usable and only that card updates when the send is done. If you reload in the meantime, the server keeps sending and the card shows "Sending…" until it finishes. Without JS the form posts normally and the page waits.
 - **Stuck "Sending".** If the handler panicked mid-send, the magnet would stay `Sending` until restart. No code path is known to panic there.
 - **Only TV and movies** have the button, as planned. "Other" magnets can't be sent yet.
 

@@ -104,5 +104,30 @@
     {% endif %}
   </section>
   {% endfor %}
+  <script>
+    // Send in the background so the page stays usable while links unlock.
+    // The send route redirects to the home page, so the response holds the
+    // updated card, which replaces this one. Without JS the form posts normally.
+    document.addEventListener("submit", async (e) => {
+      const form = e.target.closest(".send-form");
+      if (!form) return;
+      e.preventDefault();
+      const card = form.closest(".magnet");
+      const button = form.querySelector("button");
+      const hint = form.querySelector(".hint");
+      button.disabled = true;
+      button.textContent = "Sending…";
+      hint.textContent = "Unlocking links and adding them to aria2. This can take a while for big packs.";
+      try {
+        const res = await fetch(form.action, { method: "POST" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const page = new DOMParser().parseFromString(await res.text(), "text/html");
+        const fresh = page.getElementById(card.id);
+        if (fresh) card.replaceWith(fresh); else location.reload();
+      } catch (err) {
+        hint.textContent = `Couldn't reach the server (${err.message}). Reload to see whether it was sent.`;
+      }
+    });
+  </script>
 {% endif %}
 {% endblock %}

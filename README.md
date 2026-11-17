@@ -148,6 +148,8 @@ Classification runs again on every render (it's cheap), so a change to the prefi
 5. Add them all to aria2 in one `system.multicall`.
 6. Record `Sent` (with each file's GID or error) or `Failed { error }`, then redirect back to the card.
 
+The Send button is a plain form, so it works without JavaScript. A small script in `home.html` posts it with `fetch` instead: the button shows "Sending…" while the request runs, and the rest of the page stays usable. `fetch` follows the redirect, so the response is the updated home page. The script takes this magnet's card from it and swaps it in, so other cards keep whatever was typed in them. If the request fails, the card says so and asks you to reload.
+
 Once sent, the card hides the name form, since a new name couldn't change where the files are going.
 
 The Settings page checks the aria2 connection each time it loads and shows the version or the error.
