@@ -39,5 +39,32 @@
   <button type="submit" name="action" value="save_prefix">Save prefix</button>
 </form>
 
+<form method="post" action="/settings" class="card">
+  <div class="field">
+    <label for="aria2_url">aria2 RPC URL</label>
+    <input type="text" id="aria2_url" name="aria2_url" value="{{ aria2_url }}"
+           placeholder="http://localhost:6800/jsonrpc">
+  </div>
+  <div class="field">
+    <label for="aria2_secret">aria2 RPC secret</label>
+    <input type="password" id="aria2_secret" name="aria2_secret" autocomplete="off"
+           placeholder="{% if aria2_has_secret %}Set (leave blank to keep it){% else %}None{% endif %}">
+  </div>
+  <div class="hint">
+    {% if aria2_url.is_empty() %}
+      Not set. Start aria2 with <code>--enable-rpc</code> (and <code>--rpc-listen-all</code> if it's on another machine).
+    {% else if let Some(v) = aria2_version %}
+      <span class="check ok">Connected to aria2 {{ v }}.</span>
+    {% else if let Some(e) = aria2_error %}
+      <span class="check error">Could not connect: {{ e }}</span>
+    {% endif %}
+    {% if aria2_has_secret %}A secret is set.{% endif %}
+  </div>
+  <button type="submit" name="action" value="save_aria2">Save aria2</button>
+  {% if !aria2_url.is_empty() %}
+    <button type="submit" name="action" value="remove_aria2" class="secondary">Remove aria2</button>
+  {% endif %}
+</form>
+
 <p class="hint">Settings are kept in memory and are lost when the server restarts.</p>
 {% endblock %}

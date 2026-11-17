@@ -16,6 +16,9 @@
   <div class="card muted">No new magnets yet (watching since {{ since_ago }}). Reload this page to check again.</div>
 {% else %}
   <p class="muted">Magnets added since watching started ({{ since_ago }}), newest first.</p>
+  {% if let Some(e) = aria2_error %}
+    <div class="notice error">Could not get download progress from aria2: {{ e }}</div>
+  {% endif %}
   {% for m in magnets %}
   <section class="card magnet" id="magnet-{{ m.id }}">
     <div class="magnet-head">
@@ -55,6 +58,23 @@
           {% for d in m.destinations %}<code>{{ d }}</code>{% endfor %}
         </div>
       {% endif %}
+      {% if m.sending %}
+        <div class="notice pending">Sending to aria2… Reload to see when it's done.</div>
+      {% else if let Some(summary) = m.sent %}
+        <div class="notice ok">{{ summary }}</div>
+      {% else if m.sendable %}
+        {% if let Some(e) = m.send_error %}
+          <div class="notice error">Not sent: {{ e }}</div>
+        {% endif %}
+        {% if aria2_configured %}
+          <form method="post" action="/magnets/{{ m.id }}/send" class="send-form">
+            <button type="submit">Send {{ m.send_count }} file{% if m.send_count != 1 %}s{% endif %} to aria2</button>
+            <span class="hint">Check the destinations first. Each link is unlocked on AllDebrid, then added to aria2.</span>
+          </form>
+        {% else %}
+          <div class="hint"><a href="/settings">Set the aria2 RPC URL in Settings</a> to download these files.</div>
+        {% endif %}
+      {% endif %}
       <table class="files">
         <thead>
           <tr><th>File</th><th class="num">Size</th><th>Destination</th></tr>
@@ -74,6 +94,7 @@
             <td class="name">
               {% if let Some(dir) = f.dest_dir %}<code>{{ dir }}/</code>{% endif %}
               {% if let Some(new_name) = f.renamed_to %}<div class="rename">saved as <code>{{ new_name }}</code></div>{% endif %}
+              {% if let Some(d) = f.download %}<div class="download {{ f.download_class }}">{{ d }}</div>{% endif %}
             </td>
           </tr>
           {% endif %}

@@ -1,15 +1,24 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::MutexGuard;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use askama::Template;
 use rouille::{Request, Response, post_input, router};
 
 use crate::alldebrid::{Magnet, MagnetFile};
-use crate::media::{self, Decision, Kind};
-use crate::{AppState, Settings, normalize_prefix, unix_now};
+use crate::aria2::{self, Download};
+use crate::media::{self, Classification, Decision, Kind};
+use crate::{
+    AppState, CachedFiles, SendState, SentMagnet, Settings, normalize_aria2_url, normalize_prefix,
+    unix_now,
+};
 
 /// Most magnet IDs sent in one `magnet/files` request.
 const FILES_BATCH_SIZE: usize = 50;
+
+/// Pause between `link/unlock` requests, to stay well under AllDebrid's
+/// limit of 12 requests per second.
+const UNLOCK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Entry point for every HTTP request.
 pub fn handle(request: &Request, state: &AppState) -> Response {
@@ -18,6 +27,7 @@ pub fn handle(request: &Request, state: &AppState) -> Response {
         (GET) ["/settings"] => { settings_page(request, state) },
         (POST) ["/settings"] => { save_settings(request, state) },
         (POST) ["/magnets/{id}/name", id: u64] => { set_name(request, state, id) },
+        (POST) ["/magnets/{id}/send", id: u64] => { send_magnet(state, id) },
         _ => Response::empty_404()
     )
 }
@@ -31,6 +41,9 @@ struct HomeTemplate {
     error: Option<String>,
     /// How long ago "new" starts, e.g. "5 min ago".
     since_ago: String,
+    aria2_configured: bool,
+    /// Why download progress couldn't be fetched from aria2.
+    aria2_error: Option<String>,
     magnets: Vec<MagnetCard>,
 }
 
@@ -46,11 +59,23 @@ struct MagnetCard {
     files_error: Option<String>,
     /// TV / Movie / Other, once the files are known.
     kind: Option<&'static str>,
-    /// The editable show name or movie title, for TV and movies.
+    /// The editable show name or movie title, for TV and movies not yet sent.
     media_name: Option<MediaName>,
     /// Distinct destination folders of the included files.
     destinations: Vec<String>,
     files: Vec<FileRow>,
+    /// TV or movie: the kinds that can be sent to aria2.
+    is_media: bool,
+    /// Number of included files, which is what gets sent to aria2.
+    send_count: usize,
+    /// Whether the "Send to aria2" button is shown.
+    sendable: bool,
+    /// Being sent right now (by another request).
+    sending: bool,
+    /// Why the last attempt to send failed.
+    send_error: Option<String>,
+    /// Summary of what was sent and how the downloads are doing.
+    sent: Option<String>,
 }
 
 struct MediaName {
@@ -70,27 +95,33 @@ struct FileRow {
     /// New file name, when it differs from the original.
     renamed_to: Option<String>,
     excluded: Option<&'static str>,
+    /// aria2's progress for the file, once sent.
+    download: Option<String>,
+    /// CSS class for `download`: `ready`, `active`, `error` or `muted`.
+    download_class: &'static str,
 }
 
+/// aria2's status for each GID, or why it couldn't be fetched (e.g. "GID not found").
+type Downloads = HashMap<String, Result<aria2::Status, String>>;
+
 fn home(state: &AppState) -> Response {
-    // Copy what's needed so the lock isn't held during AllDebrid requests.
-    let (api_key, prefix) = {
-        let s = settings(state);
-        (s.alldebrid_api_key.clone(), s.dest_prefix.clone())
-    };
+    // Copy the settings so the lock isn't held during HTTP requests.
+    let s = settings(state).clone();
     let now = unix_now();
 
     let mut page = HomeTemplate {
-        has_api_key: api_key.is_some(),
+        has_api_key: s.alldebrid_api_key.is_some(),
         error: None,
         since_ago: format_ago(now - state.since),
+        aria2_configured: s.aria2_url.is_some(),
+        aria2_error: None,
         magnets: Vec::new(),
     };
-    let Some(key) = api_key else {
+    let Some(key) = &s.alldebrid_api_key else {
         return render(&page);
     };
 
-    let mut magnets = match state.alldebrid.magnets(&key) {
+    let mut magnets = match state.alldebrid.magnets(key) {
         Ok(m) => m,
         Err(e) => {
             log::warn!("failed to list magnets: {e}");
@@ -99,20 +130,30 @@ fn home(state: &AppState) -> Response {
         }
     };
     magnets.retain(|m| m.upload_date >= state.since);
-    magnets.sort_by(|a, b| b.upload_date.cmp(&a.upload_date));
+    magnets.sort_by_key(|m| std::cmp::Reverse(m.upload_date));
 
-    let file_errors = fetch_missing_files(state, &key, &magnets);
-    let cache = state.files.lock().unwrap_or_else(|e| e.into_inner());
-    let overrides = state.name_overrides.lock().unwrap_or_else(|e| e.into_inner());
+    let file_errors = fetch_missing_files(state, key, &magnets);
+    let (downloads, aria2_error) = fetch_download_statuses(state, &s, &magnets);
+    page.aria2_error = aria2_error;
+
+    let cache = lock(&state.files);
+    let overrides = lock(&state.name_overrides);
+    let sends = lock(&state.sends);
     page.magnets = magnets
         .iter()
         .map(|m| {
-            let files = cache.get(&m.id).map(Vec::as_slice);
+            let files = cache.get(&m.id).map(|c| c.files.as_slice());
             let error = file_errors.get(&m.id).cloned();
             let name_override = overrides.get(&m.id).map(String::as_str);
-            magnet_card(m, files, error, name_override, &prefix, now)
+            let send = sends.get(&m.id);
+            let mut card = magnet_card(m, files, error, name_override, &s.dest_prefix, now);
+            if card.ready {
+                add_send_info(&mut card, m, send, &downloads, now);
+            }
+            card
         })
         .collect();
+    drop(sends);
     drop(overrides);
     drop(cache);
 
@@ -122,25 +163,29 @@ fn home(state: &AppState) -> Response {
 /// Fetches file lists for ready magnets that aren't cached yet, and caches
 /// them. Returns an error message for each magnet whose list couldn't be fetched.
 fn fetch_missing_files(state: &AppState, key: &str, magnets: &[Magnet]) -> HashMap<u64, String> {
-    let missing: Vec<u64> = {
-        let cache = state.files.lock().unwrap_or_else(|e| e.into_inner());
+    let missing: Vec<&Magnet> = {
+        let cache = lock(&state.files);
         magnets
             .iter()
             .filter(|m| m.is_ready() && !cache.contains_key(&m.id))
-            .map(|m| m.id)
             .collect()
     };
 
     let mut errors = HashMap::new();
-    for ids in missing.chunks(FILES_BATCH_SIZE) {
+    for batch in missing.chunks(FILES_BATCH_SIZE) {
+        let ids: Vec<u64> = batch.iter().map(|m| m.id).collect();
         log::info!("fetching file lists for {} magnet(s)", ids.len());
-        match state.alldebrid.magnet_files(key, ids) {
+        match state.alldebrid.magnet_files(key, &ids) {
             Ok(results) => {
-                let mut cache = state.files.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cache = lock(&state.files);
                 for (id, result) in results {
+                    let Some(magnet) = batch.iter().find(|m| m.id == id) else {
+                        continue;
+                    };
                     match result {
                         Ok(files) => {
-                            cache.insert(id, files);
+                            let magnet_name = magnet.filename.clone();
+                            cache.insert(id, CachedFiles { magnet_name, files });
                         }
                         Err(e) => {
                             errors.insert(id, format!("{} ({})", e.message, e.code));
@@ -148,20 +193,63 @@ fn fetch_missing_files(state: &AppState, key: &str, magnets: &[Magnet]) -> HashM
                     }
                 }
                 for id in ids {
-                    if !cache.contains_key(id) && !errors.contains_key(id) {
-                        errors.insert(*id, "AllDebrid returned no file list".to_string());
+                    if !cache.contains_key(&id) && !errors.contains_key(&id) {
+                        errors.insert(id, "AllDebrid returned no file list".to_string());
                     }
                 }
             }
             Err(e) => {
                 log::warn!("failed to fetch file lists: {e}");
                 for id in ids {
-                    errors.insert(*id, e.to_string());
+                    errors.insert(id, e.to_string());
                 }
             }
         }
     }
     errors
+}
+
+/// Asks aria2 how the downloads of the shown, sent magnets are doing, in one
+/// request. Returns the statuses by GID, and an error if aria2 couldn't be asked.
+fn fetch_download_statuses(
+    state: &AppState,
+    settings: &Settings,
+    magnets: &[Magnet],
+) -> (Downloads, Option<String>) {
+    let gids: Vec<String> = {
+        let sends = lock(&state.sends);
+        magnets
+            .iter()
+            .filter_map(|m| match sends.get(&m.id) {
+                Some(SendState::Sent(sent)) => Some(sent.results.values()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|r| r.as_ref().ok().cloned())
+            .collect()
+    };
+    let Some(endpoint) = settings.aria2_endpoint() else {
+        return (HashMap::new(), None);
+    };
+    if gids.is_empty() {
+        return (HashMap::new(), None);
+    }
+
+    let gid_refs: Vec<&str> = gids.iter().map(String::as_str).collect();
+    match state.aria2.statuses(&endpoint, &gid_refs) {
+        Ok(statuses) => {
+            let downloads = gids
+                .into_iter()
+                .zip(statuses)
+                .map(|(gid, status)| (gid, status.map_err(|e| e.message)))
+                .collect();
+            (downloads, None)
+        }
+        Err(e) => {
+            log::warn!("failed to get download statuses from aria2: {e}");
+            (HashMap::new(), Some(e.to_string()))
+        }
+    }
 }
 
 fn magnet_card(
@@ -179,7 +267,7 @@ fn magnet_card(
     } else {
         "active"
     };
-    let mut card = MagnetCard {
+    MagnetCard {
         id: m.id,
         name: m.filename.clone(),
         size: format_size(m.size),
@@ -192,12 +280,30 @@ fn magnet_card(
         media_name: None,
         destinations: Vec::new(),
         files: Vec::new(),
-    };
+        is_media: false,
+        send_count: 0,
+        sendable: false,
+        sending: false,
+        send_error: None,
+        sent: None,
+    }
+    .with_files(m, files, name_override, prefix)
+}
 
-    if let (true, Some(files)) = (m.is_ready(), files) {
+impl MagnetCard {
+    /// Fills in the kind, name and file rows from a fresh classification.
+    fn with_files(
+        mut self,
+        m: &Magnet,
+        files: Option<&[MagnetFile]>,
+        name_override: Option<&str>,
+        prefix: &str,
+    ) -> Self {
+        let Some(files) = files.filter(|_| m.is_ready()) else {
+            return self;
+        };
         let classification = media::classify(&m.filename, files, prefix, name_override);
-        card.kind = Some(classification.kind.label());
-        card.media_name = classification.detected_name.map(|detected| MediaName {
+        self.media_name = classification.detected_name.clone().map(|detected| MediaName {
             label: match classification.kind {
                 Kind::Movie => "Movie title",
                 _ => "Show name",
@@ -206,9 +312,17 @@ fn magnet_card(
             overridden: name_override.is_some_and(|n| n != detected),
             detected,
         });
-        let top_folder = format!("{}/", m.filename);
+        self.set_files(&m.filename, classification);
+        self
+    }
+
+    /// Fills in the kind, destinations and file rows from a classification.
+    fn set_files(&mut self, magnet_name: &str, classification: Classification) {
+        self.kind = Some(classification.kind.label());
+        self.is_media = matches!(classification.kind, Kind::Tv | Kind::Movie);
+        let top_folder = format!("{magnet_name}/");
         let mut destinations = BTreeSet::new();
-        card.files = classification
+        self.files = classification
             .files
             .into_iter()
             .map(|planned| {
@@ -225,6 +339,8 @@ fn magnet_card(
                     dest_dir: None,
                     renamed_to: None,
                     excluded: None,
+                    download: None,
+                    download_class: "muted",
                 };
                 match planned.decision {
                     Decision::Include {
@@ -242,9 +358,109 @@ fn magnet_card(
                 row
             })
             .collect();
-        card.destinations = destinations.into_iter().collect();
+        self.send_count = self.files.iter().filter(|f| f.excluded.is_none()).count();
+        self.destinations = destinations.into_iter().collect();
     }
-    card
+}
+
+/// Adds the aria2 part of a ready magnet's card: the send button, the
+/// result of the last attempt, or the progress of the downloads.
+fn add_send_info(
+    card: &mut MagnetCard,
+    m: &Magnet,
+    send: Option<&SendState>,
+    downloads: &Downloads,
+    now: i64,
+) {
+    let can_send = card.is_media && card.send_count > 0;
+    match send {
+        None => card.sendable = can_send,
+        Some(SendState::Failed { error }) => {
+            card.sendable = can_send;
+            card.send_error = Some(error.clone());
+        }
+        Some(SendState::Sending) => {
+            card.sending = true;
+            card.media_name = None;
+        }
+        Some(SendState::Sent(sent)) => {
+            // Show the destinations as sent, not as they'd be now.
+            card.media_name = None;
+            card.set_files(&m.filename, sent.classification.clone());
+            for (row, planned) in card.files.iter_mut().zip(&sent.classification.files) {
+                if let Some(result) = sent.results.get(&planned.file.path) {
+                    let (label, class) = download_label(result, downloads);
+                    row.download = Some(label);
+                    row.download_class = class;
+                }
+            }
+            card.sent = Some(sent_summary(sent, downloads, now));
+        }
+    }
+}
+
+/// One line of status for a sent file.
+fn download_label(result: &Result<String, String>, downloads: &Downloads) -> (String, &'static str) {
+    let gid = match result {
+        Ok(gid) => gid,
+        Err(e) => return (format!("aria2 refused it: {e}"), "error"),
+    };
+    match downloads.get(gid) {
+        None => (format!("Sent to aria2 (GID {gid})"), "muted"),
+        Some(Err(_)) => ("No longer in aria2".to_string(), "muted"),
+        Some(Ok(s)) => match s.status.as_str() {
+            "complete" => ("Downloaded".to_string(), "ready"),
+            "active" => {
+                let mut label = format!("Downloading {}%", percent(s.completed_length, s.total_length));
+                if s.download_speed > 0 {
+                    label.push_str(&format!(" · {}/s", format_size(s.download_speed)));
+                }
+                (label, "active")
+            }
+            "waiting" => ("Queued in aria2".to_string(), "muted"),
+            "paused" => ("Paused in aria2".to_string(), "muted"),
+            "removed" => ("Removed from aria2".to_string(), "error"),
+            "error" => {
+                let msg = s.error_message.as_deref().unwrap_or("unknown error");
+                (format!("Download failed: {msg}"), "error")
+            }
+            other => (other.to_string(), "muted"),
+        },
+    }
+}
+
+/// e.g. "Sent to aria2 5 min ago · 2 of 6 files downloaded · 1.2 GB of 4.0 GB (30%) · 5.0 MB/s".
+fn sent_summary(sent: &SentMagnet, downloads: &Downloads, now: i64) -> String {
+    let gids: Vec<&String> = sent.results.values().filter_map(|r| r.as_ref().ok()).collect();
+    let refused = sent.results.len() - gids.len();
+    let statuses: Vec<&aria2::Status> = gids
+        .iter()
+        .filter_map(|gid| downloads.get(*gid)?.as_ref().ok())
+        .collect();
+
+    let mut parts = vec![format!("Sent to aria2 {}", format_ago(now - sent.at))];
+    if !statuses.is_empty() {
+        let complete = statuses.iter().filter(|s| s.status == "complete").count();
+        parts.push(format!("{complete} of {} {} downloaded", gids.len(), plural(gids.len(), "file")));
+        let total: u64 = statuses.iter().map(|s| s.total_length).sum();
+        let done: u64 = statuses.iter().map(|s| s.completed_length).sum();
+        if total > 0 {
+            parts.push(format!(
+                "{} of {} ({}%)",
+                format_size(done),
+                format_size(total),
+                percent(done, total)
+            ));
+        }
+        let speed: u64 = statuses.iter().map(|s| s.download_speed).sum();
+        if speed > 0 {
+            parts.push(format!("{}/s", format_size(speed)));
+        }
+    }
+    if refused > 0 {
+        parts.push(format!("{refused} {} refused by aria2", plural(refused, "file")));
+    }
+    parts.join(" · ")
 }
 
 /// Sets or clears the show name / movie title used for one magnet.
@@ -257,7 +473,7 @@ fn set_name(request: &Request, state: &AppState, id: u64) -> Response {
         Err(_) => return Response::text("Bad form data").with_status_code(400),
     };
 
-    let mut overrides = state.name_overrides.lock().unwrap_or_else(|e| e.into_inner());
+    let mut overrides = lock(&state.name_overrides);
     let name = match form.action.as_deref() {
         Some("reset") => None,
         _ => media::clean_name_override(&form.name.unwrap_or_default()),
@@ -275,6 +491,125 @@ fn set_name(request: &Request, state: &AppState, id: u64) -> Response {
     Response::redirect_303(format!("/#magnet-{id}"))
 }
 
+// ---------- Sending to aria2 ----------
+
+/// Sends a magnet's included files to aria2, once.
+fn send_magnet(state: &AppState, id: u64) -> Response {
+    let back = Response::redirect_303(format!("/#magnet-{id}"));
+
+    // Claim the magnet, so a double click or a second tab can't send it twice.
+    {
+        let mut sends = lock(&state.sends);
+        if matches!(sends.get(&id), Some(SendState::Sending | SendState::Sent(_))) {
+            log::info!("magnet {id}: already sent, or being sent");
+            return back;
+        }
+        sends.insert(id, SendState::Sending);
+    }
+
+    let s = settings(state).clone();
+    let outcome = match send_files(state, &s, id) {
+        Ok(sent) => SendState::Sent(sent),
+        Err(error) => {
+            log::warn!("magnet {id}: not sent: {error}");
+            SendState::Failed { error }
+        }
+    };
+    lock(&state.sends).insert(id, outcome);
+    back
+}
+
+/// Unlocks the links of the included files and adds them to aria2. If any
+/// link can't be unlocked, or aria2 can't be reached, nothing is sent.
+fn send_files(state: &AppState, s: &Settings, id: u64) -> Result<SentMagnet, String> {
+    let key = s
+        .alldebrid_api_key
+        .as_deref()
+        .ok_or("No AllDebrid API key is set.")?;
+    let endpoint = s
+        .aria2_endpoint()
+        .ok_or("The aria2 RPC URL isn't set. Add it in Settings.")?;
+
+    // Classify again, so what's sent matches what the page showed.
+    let classification = {
+        let cache = lock(&state.files);
+        let cached = cache
+            .get(&id)
+            .ok_or("The file list isn't loaded. Reload the page and try again.")?;
+        let overrides = lock(&state.name_overrides);
+        let name_override = overrides.get(&id).map(String::as_str);
+        media::classify(&cached.magnet_name, &cached.files, &s.dest_prefix, name_override)
+    };
+    if !matches!(classification.kind, Kind::Tv | Kind::Movie) {
+        return Err("Only TV and movie magnets can be sent.".to_string());
+    }
+    let included: Vec<(&MagnetFile, &str, &str)> = classification
+        .files
+        .iter()
+        .filter_map(|p| match &p.decision {
+            Decision::Include {
+                dest_dir,
+                file_name,
+            } => Some((&p.file, dest_dir.as_str(), file_name.as_str())),
+            Decision::Exclude { .. } => None,
+        })
+        .collect();
+    if included.is_empty() {
+        return Err("No files are included.".to_string());
+    }
+
+    // Check aria2 first, so a wrong URL or secret doesn't waste unlock requests.
+    state
+        .aria2
+        .version(&endpoint)
+        .map_err(|e| e.to_string())?;
+
+    log::info!("magnet {id}: unlocking {} link(s)", included.len());
+    let mut urls = Vec::with_capacity(included.len());
+    for (i, (file, _, _)) in included.iter().enumerate() {
+        if file.link.is_empty() {
+            return Err(format!("{} has no AllDebrid link.", file.path));
+        }
+        if i > 0 {
+            std::thread::sleep(UNLOCK_INTERVAL);
+        }
+        let url = state
+            .alldebrid
+            .unlock_link(key, &file.link)
+            .map_err(|e| format!("Could not unlock {}: {e}", file.path))?;
+        urls.push(url);
+    }
+
+    let downloads: Vec<Download> = included
+        .iter()
+        .zip(&urls)
+        .map(|((_, dir, out), url)| Download { url, dir, out })
+        .collect();
+    let results = state
+        .aria2
+        .add_uris(&endpoint, &downloads)
+        .map_err(|e| e.to_string())?;
+
+    let mut by_path = HashMap::new();
+    let mut results = results.into_iter();
+    for (file, _, _) in &included {
+        let result = match results.next() {
+            Some(Ok(gid)) => Ok(gid),
+            Some(Err(e)) => Err(e.message),
+            None => Err("aria2 gave no reply for this file".to_string()),
+        };
+        by_path.insert(file.path.clone(), result);
+    }
+    let added = by_path.values().filter(|r| r.is_ok()).count();
+    log::info!("magnet {id}: added {added} of {} file(s) to aria2", by_path.len());
+
+    Ok(SentMagnet {
+        at: unix_now(),
+        classification,
+        results: by_path,
+    })
+}
+
 // ---------- Settings ----------
 
 #[derive(Template)]
@@ -283,16 +618,36 @@ struct SettingsTemplate {
     masked_key: Option<String>,
     username: Option<String>,
     dest_prefix: String,
+    /// The aria2 RPC URL, or empty if not set.
+    aria2_url: String,
+    aria2_has_secret: bool,
+    /// aria2's version, if it answered.
+    aria2_version: Option<String>,
+    /// Why aria2 couldn't be reached.
+    aria2_error: Option<String>,
     saved: bool,
     error: Option<String>,
 }
 
 impl SettingsTemplate {
-    fn new(settings: &Settings) -> Self {
+    /// Builds the page, checking the connection to aria2 if it's set up.
+    fn new(state: &AppState) -> Self {
+        let s = settings(state).clone();
+        let (aria2_version, aria2_error) = match s.aria2_endpoint() {
+            Some(endpoint) => match state.aria2.version(&endpoint) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            None => (None, None),
+        };
         Self {
-            masked_key: settings.alldebrid_api_key.as_deref().map(mask_key),
-            username: settings.alldebrid_username.clone(),
-            dest_prefix: settings.dest_prefix.clone(),
+            masked_key: s.alldebrid_api_key.as_deref().map(mask_key),
+            username: s.alldebrid_username.clone(),
+            dest_prefix: s.dest_prefix.clone(),
+            aria2_url: s.aria2_url.clone().unwrap_or_default(),
+            aria2_has_secret: s.aria2_secret.is_some(),
+            aria2_version,
+            aria2_error,
             saved: false,
             error: None,
         }
@@ -300,7 +655,7 @@ impl SettingsTemplate {
 }
 
 fn settings_page(request: &Request, state: &AppState) -> Response {
-    let mut page = SettingsTemplate::new(&settings(state));
+    let mut page = SettingsTemplate::new(state);
     page.saved = request.get_param("saved").is_some();
     render(&page)
 }
@@ -309,6 +664,8 @@ fn save_settings(request: &Request, state: &AppState) -> Response {
     let form = match post_input!(request, {
         alldebrid_api_key: Option<String>,
         dest_prefix: Option<String>,
+        aria2_url: Option<String>,
+        aria2_secret: Option<String>,
         action: Option<String>,
     }) {
         Ok(form) => form,
@@ -333,6 +690,31 @@ fn save_settings(request: &Request, state: &AppState) -> Response {
                 }
                 None => settings_error(state, "Enter a destination prefix to save.".to_string()),
             }
+        }
+        Some("save_aria2") => {
+            match normalize_aria2_url(&form.aria2_url.unwrap_or_default()) {
+                Ok(url) => {
+                    log::info!("aria2 RPC URL set to {url}");
+                    let mut s = settings(state);
+                    s.aria2_url = Some(url);
+                    // A blank secret field keeps the current secret.
+                    let secret = form.aria2_secret.unwrap_or_default();
+                    if !secret.trim().is_empty() {
+                        log::info!("aria2 RPC secret changed");
+                        s.aria2_secret = Some(secret.trim().to_string());
+                    }
+                    // The settings page checks the connection when it loads.
+                    Response::redirect_303("/settings?saved")
+                }
+                Err(e) => settings_error(state, e.to_string()),
+            }
+        }
+        Some("remove_aria2") => {
+            let mut s = settings(state);
+            s.aria2_url = None;
+            s.aria2_secret = None;
+            log::info!("aria2 settings removed");
+            Response::redirect_303("/settings?saved")
         }
         _ => Response::text("Unknown action").with_status_code(400),
     }
@@ -359,17 +741,22 @@ fn save_key(state: &AppState, key: String) -> Response {
 
 /// Re-renders the settings page with an error, leaving the stored settings unchanged.
 fn settings_error(state: &AppState, error: String) -> Response {
-    let mut page = SettingsTemplate::new(&settings(state));
+    let mut page = SettingsTemplate::new(state);
     page.error = Some(error);
     render(&page).with_status_code(400)
 }
 
 // ---------- Helpers ----------
 
-/// Locks the settings. A panic elsewhere while holding the lock can't leave
-/// `Settings` half-updated, so a poisoned lock is safe to keep using.
+/// Locks the settings.
 fn settings(state: &AppState) -> MutexGuard<'_, Settings> {
-    state.settings.lock().unwrap_or_else(|e| e.into_inner())
+    lock(&state.settings)
+}
+
+/// Locks some shared state. A panic elsewhere while holding a lock can't
+/// leave any of the state half-updated, so a poisoned lock is safe to keep using.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn render(template: &impl Template) -> Response {
@@ -419,6 +806,23 @@ fn format_ago(secs: i64) -> String {
     }
 }
 
+/// Whole percent, rounded down so 100% means really finished.
+fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        (done as u128 * 100 / total as u128) as u64
+    }
+}
+
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +846,67 @@ mod tests {
     fn masks_key() {
         assert_eq!(mask_key("abcdefgh1234"), "••••••••1234");
         assert_eq!(mask_key("abcd"), "••••••••");
+    }
+
+    #[test]
+    fn percents() {
+        assert_eq!(percent(0, 0), 0);
+        assert_eq!(percent(999, 1000), 99);
+        assert_eq!(percent(1000, 1000), 100);
+    }
+
+    fn status(state: &str, done: u64, total: u64, speed: u64) -> aria2::Status {
+        aria2::Status {
+            status: state.to_string(),
+            total_length: total,
+            completed_length: done,
+            download_speed: speed,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn download_labels() {
+        let mut downloads = Downloads::new();
+        downloads.insert("a".into(), Ok(status("active", 50, 200, 2048)));
+        downloads.insert("b".into(), Ok(status("complete", 10, 10, 0)));
+        downloads.insert("c".into(), Err("GID c is not found".into()));
+
+        let label = |r: Result<&str, &str>| {
+            download_label(&r.map(String::from).map_err(String::from), &downloads)
+        };
+        assert_eq!(label(Ok("a")), ("Downloading 25% · 2.0 KB/s".to_string(), "active"));
+        assert_eq!(label(Ok("b")), ("Downloaded".to_string(), "ready"));
+        assert_eq!(label(Ok("c")), ("No longer in aria2".to_string(), "muted"));
+        assert_eq!(label(Ok("d")), ("Sent to aria2 (GID d)".to_string(), "muted"));
+        assert_eq!(label(Err("bad")), ("aria2 refused it: bad".to_string(), "error"));
+    }
+
+    #[test]
+    fn summarises_sent_magnet() {
+        let sent = SentMagnet {
+            at: 1000,
+            classification: Classification {
+                kind: Kind::Tv,
+                detected_name: None,
+                files: Vec::new(),
+            },
+            results: HashMap::from([
+                ("x/1.mkv".to_string(), Ok("a".to_string())),
+                ("x/2.mkv".to_string(), Ok("b".to_string())),
+                ("x/3.mkv".to_string(), Err("nope".to_string())),
+            ]),
+        };
+        let mut downloads = Downloads::new();
+        downloads.insert("a".into(), Ok(status("active", 0, 1024, 1024)));
+        downloads.insert("b".into(), Ok(status("complete", 1024, 1024, 0)));
+        assert_eq!(
+            sent_summary(&sent, &downloads, 1000 + 300),
+            "Sent to aria2 5 min ago · 1 of 2 files downloaded · 1.0 KB of 2.0 KB (50%) · 1.0 KB/s · 1 file refused by aria2"
+        );
+        assert_eq!(
+            sent_summary(&sent, &Downloads::new(), 1000),
+            "Sent to aria2 just now · 1 file refused by aria2"
+        );
     }
 }

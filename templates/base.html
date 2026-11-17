@@ -71,6 +71,18 @@
     .name-row { display: flex; gap: 8px; flex-wrap: wrap; }
     .name-row input { flex: 1 1 240px; width: auto; }
     .name-row button { margin: 0; }
+    .send-form { margin-top: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .send-form button { margin: 0; }
+    .send-form .hint { margin: 0; }
+    .download { font-size: 12px; margin-top: 2px; }
+    .download.ready { color: var(--ok); }
+    .download.active { color: var(--warn); }
+    .download.error { color: var(--err); }
+    .download.muted { color: var(--muted); }
+    .field + .field { margin-top: 12px; }
+    .check { font-weight: 500; }
+    .check.ok { color: var(--ok); }
+    .check.error { color: var(--err); }
   </style>
 </head>
 <body>

@@ -379,10 +379,10 @@ fn classify_movie(
                     // Files are flattened into one folder, so avoid name clashes
                     // (e.g. `Subs/A/English.srt` and `Subs/B/English.srt`).
                     let mut file_name = info.name.to_string();
-                    if used_names.contains(&file_name) {
-                        if let Some(parent) = info.dirs.last() {
-                            file_name = format!("{parent}.{file_name}");
-                        }
+                    if used_names.contains(&file_name)
+                        && let Some(parent) = info.dirs.last()
+                    {
+                        file_name = format!("{parent}.{file_name}");
                     }
                     used_names.insert(file_name.clone());
                     Decision::Include {

@@ -55,7 +55,7 @@ impl Client {
         &self,
         api_key: &str,
         ids: &[u64],
-    ) -> Result<Vec<(u64, Result<Vec<MagnetFile>, ApiError>)>, Error> {
+    ) -> Result<Vec<(u64, FilesResult)>, Error> {
         let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
         let form = ids.iter().map(|id| ("id[]", id.as_str()));
         let response = self
@@ -66,6 +66,73 @@ impl Client {
         let data: FilesData = parse(response)?;
         Ok(data.magnets.into_iter().map(FilesEntry::into_result).collect())
     }
+
+    /// Turns an AllDebrid file link (`https://alldebrid.com/f/...`) into a
+    /// direct download URL. Direct URLs expire, so unlock just before use.
+    ///
+    /// If AllDebrid needs time to generate the link, this waits for it,
+    /// checking every few seconds for up to about a minute.
+    pub fn unlock_link(&self, api_key: &str, link: &str) -> Result<String, Error> {
+        let response = self
+            .agent
+            .post(format!("{BASE_URL}/v4/link/unlock"))
+            .header("Authorization", format!("Bearer {api_key}"))
+            .send_form([("link", link)])?;
+        let data: UnlockData = parse(response)?;
+        match data.delayed {
+            Some(id) => self.wait_for_delayed_link(api_key, id),
+            None if !data.link.is_empty() => Ok(data.link),
+            None => Err(api_error("NO_LINK", "AllDebrid returned no download link")),
+        }
+    }
+
+    fn wait_for_delayed_link(&self, api_key: &str, id: u64) -> Result<String, Error> {
+        // AllDebrid asks for at least 5 seconds between checks.
+        const INTERVAL: Duration = Duration::from_secs(5);
+        const ATTEMPTS: u32 = 12;
+
+        log::info!("waiting for delayed link {id}");
+        for _ in 0..ATTEMPTS {
+            std::thread::sleep(INTERVAL);
+            let id = id.to_string();
+            let response = self
+                .agent
+                .post(format!("{BASE_URL}/v4/link/delayed"))
+                .header("Authorization", format!("Bearer {api_key}"))
+                .send_form([("id", id.as_str())])?;
+            let data: DelayedData = parse(response)?;
+            match data.status {
+                2 if !data.link.is_empty() => return Ok(data.link),
+                3 => return Err(api_error("DELAYED_FAILED", "AllDebrid could not generate the download link")),
+                _ => {}
+            }
+        }
+        Err(api_error("DELAYED_TIMEOUT", "AllDebrid took too long to generate the download link"))
+    }
+}
+
+fn api_error(code: &str, message: &str) -> Error {
+    Error::Api(ApiError {
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+}
+
+#[derive(Deserialize)]
+struct UnlockData {
+    #[serde(default)]
+    link: String,
+    /// Set when the link isn't ready yet; poll `link/delayed` with it.
+    #[serde(default)]
+    delayed: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct DelayedData {
+    /// 1: still processing, 2: ready, 3: failed.
+    status: u32,
+    #[serde(default)]
+    link: String,
 }
 
 fn parse<T: DeserializeOwned>(mut response: ureq::http::Response<ureq::Body>) -> Result<T, Error> {
@@ -171,6 +238,9 @@ impl Magnet {
         self.status_code >= 5
     }
 }
+
+/// One magnet's file list from `magnet/files`, or why AllDebrid couldn't give it.
+pub type FilesResult = Result<Vec<MagnetFile>, ApiError>;
 
 /// One file inside a magnet, with its folder path flattened.
 #[derive(Debug, Clone)]
@@ -366,6 +436,27 @@ mod tests {
 
         assert_eq!(results[1].1.as_ref().unwrap()[0].path, "single.mkv");
         assert_eq!(results[2].1.as_ref().unwrap_err().code, "MAGNET_INVALID_ID");
+    }
+
+    #[test]
+    fn parses_unlock() {
+        let body = r#"{"status":"success","data":{
+            "link":"http:\/\/ombfyx.debrid.it\/dl\/abcdefgh12\/somefile.txt","host":"example",
+            "filename":"somefile.txt","paws":false,"filesize":699400192,"streams":[],
+            "id":"abcdefgh12","hostDomain":"example.com"}}"#;
+        let env: Envelope<UnlockData> = serde_json::from_str(body).unwrap();
+        let Envelope::Success { data } = env else {
+            panic!("expected success")
+        };
+        assert_eq!(data.link, "http://ombfyx.debrid.it/dl/abcdefgh12/somefile.txt");
+        assert_eq!(data.delayed, None);
+
+        let body = r#"{"status":"success","data":{"link":"","delayed":42}}"#;
+        let env: Envelope<UnlockData> = serde_json::from_str(body).unwrap();
+        let Envelope::Success { data } = env else {
+            panic!("expected success")
+        };
+        assert_eq!(data.delayed, Some(42));
     }
 
     #[test]
