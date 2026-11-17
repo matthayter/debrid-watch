@@ -49,6 +49,23 @@ services.debrid-watch = {
 };
 ```
 
+Without flakes, import the module from a fetched copy of the source instead. It then builds the package with your system's nixpkgs:
+
+```nix
+{ ... }:
+let
+  debrid-watch = builtins.fetchTarball {
+    url = "https://github.com/<owner>/debrid-watch/archive/<commit>.tar.gz";
+    sha256 = "...";   # build once with lib.fakeSha256, then copy the hash from the error
+  };
+in {
+  imports = [ "${debrid-watch}/nix/module.nix" ];
+  services.debrid-watch.enable = true;
+}
+```
+
+`nix-build` or `nix-env -f . -i` in a checkout builds or installs just the package (`default.nix`).
+
 Secrets go in `environmentFile`, never in Nix options, because anything in the Nix config ends up in the world-readable `/nix/store`. Its contents look like this:
 
 ```sh

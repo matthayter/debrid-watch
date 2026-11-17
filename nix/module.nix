@@ -1,8 +1,7 @@
 # NixOS module: services.debrid-watch
 #
-# The flake passes in a function from a system string to its own package,
-# used as the default for `package`; see `nixosModules.default` in flake.nix.
-packageFor:
+# Works without flakes: import this file directly. The flake's
+# nixosModules.default wraps it to use the flake's pinned build instead.
 { config, lib, pkgs, ... }:
 
 let
@@ -14,8 +13,11 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = packageFor pkgs.stdenv.hostPlatform.system;
-      defaultText = lib.literalMD "the package from the debrid-watch flake";
+      default = pkgs.callPackage ./package.nix { };
+      defaultText = lib.literalMD ''
+        debrid-watch built with the system's nixpkgs, or with the flake's
+        pinned nixpkgs when the module comes from the flake
+      '';
       description = "The debrid-watch package to run.";
     };
 
