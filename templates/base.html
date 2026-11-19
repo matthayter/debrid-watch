@@ -84,6 +84,9 @@
     .check { font-weight: 500; }
     .check.ok { color: var(--ok); }
     .check.error { color: var(--err); }
+    .pager { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+             margin: 0 0 16px; font-size: 14px; }
+    .pager a { text-decoration: none; }
   </style>
 </head>
 <body>
@@ -92,6 +95,7 @@
       <span class="brand">debrid-watch</span>
       <nav>
         <a href="/" {% block nav_home %}{% endblock %}>Home</a>
+        <a href="/latest" {% block nav_latest %}{% endblock %}>Latest</a>
         <a href="/settings" {% block nav_settings %}{% endblock %}>Settings</a>
       </nav>
     </div>

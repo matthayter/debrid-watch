@@ -1,6 +1,6 @@
 # debrid-watch
 
-A small personal web server that watches an [AllDebrid](https://alldebrid.com) account for newly added magnets, lists the files in each one, and works out where each file should be downloaded to (TV / movies / other). Once you've checked the destinations, one click sends a TV or movie magnet's files to an [aria2](https://aria2.github.io/) instance to download, and the page then shows their progress.
+A small personal web server that shows the magnets on an [AllDebrid](https://alldebrid.com) account (all of them, 10 per page, plus a Latest tab of those added since startup), lists the files in each one, and works out where each file should be downloaded to (TV / movies / other). Once you've checked the destinations, one click sends a TV or movie magnet's files to an [aria2](https://aria2.github.io/) instance to download, and the page then shows their progress.
 
 Everything is held in memory. Restarting the server clears the settings, cached file lists, name overrides and the record of what was sent to aria2.
 
@@ -59,7 +59,8 @@ src/
   web.rs        routes, handlers, and the view data handed to templates
 templates/
   base.html     layout, nav and all CSS (light/dark)
-  home.html     new magnets, their files and destinations
+  magnets.html  magnet list (Home and Latest), their files and destinations
+  pager.html    newer/older links for the Home list
   settings.html API key, destination prefix and aria2
 ```
 
@@ -68,7 +69,7 @@ templates/
 `AppState` is created once and shared with every request through an `Arc`:
 
 - `settings: Mutex<Settings>`: the API key, the AllDebrid username, the destination prefix, and the aria2 RPC URL and secret.
-- `since: i64`: magnets with `uploadDate >= since` count as new.
+- `since: i64`: magnets with `uploadDate >= since` count as new and show on the Latest tab.
 - `files: Mutex<HashMap<magnet id, CachedFiles>>`: the file-list cache (the magnet's name and its `Vec<MagnetFile>`). Each ready magnet's list is fetched only once.
 - `name_overrides: Mutex<HashMap<magnet id, String>>`: show names or movie titles set by the user.
 - `sends: Mutex<HashMap<magnet id, SendState>>`: magnets sent to aria2. `Sending` while a request is unlocking and adding; `Failed { error }` if nothing was added (it can be retried); `Sent(SentMagnet)` once added, holding the classification as it was when sent and each file's aria2 GID (or why aria2 refused it).
@@ -127,15 +128,15 @@ Everything in this module is a pure function covered by unit tests, many of them
 
 #### `web.rs`: request flow
 
-Routes: `GET /`, `GET /settings`, `POST /settings` (with `action` set to `save_key`, `remove_key`, `save_prefix`, `save_aria2` or `remove_aria2`), `POST /magnets/{id}/name` (with `action` set to `save` or `reset`), and `POST /magnets/{id}/send`. Every POST redirects afterwards (303), so reloading a page never re-submits a form.
+Routes: `GET /` (every magnet, 10 per page, `?page=N`), `GET /latest` (magnets added since `since`), `GET /settings`, `POST /settings` (with `action` set to `save_key`, `remove_key`, `save_prefix`, `save_aria2` or `remove_aria2`), `POST /magnets/{id}/name` (with `action` set to `save` or `reset`), and `POST /magnets/{id}/send`. Every POST redirects afterwards (303), so reloading a page never re-submits a form.
 
-`GET /` works like this:
+`GET /` and `GET /latest` work like this:
 
 1. Copy the settings, then release the lock.
-2. `magnets()`: keep those added since `since`, newest first.
+2. `magnets()`, sorted newest first. Home keeps the requested page of 10 (an out-of-range page shows the nearest one); Latest keeps those added since `since`.
 3. `fetch_missing_files()`: for ready magnets (`statusCode == 4`) not in the cache, call `magnet_files()` in batches of 50 and cache the results. Errors for individual magnets are shown on their cards and retried on the next load.
 4. `fetch_download_statuses()`: if any shown magnets have been sent, ask aria2 for the status of all their GIDs in one request. If aria2 can't be reached, the page says so and shows no progress.
-5. For each magnet, run `media::classify` with the cached files, the prefix and any name override, then build the `MagnetCard` view data for `home.html`. A sent magnet uses its saved classification instead, and gets each file's download status and a summary line.
+5. For each magnet, run `media::classify` with the cached files, the prefix and any name override, then build the `MagnetCard` view data for `magnets.html`. A sent magnet uses its saved classification instead, and gets each file's download status and a summary line.
 
 Classification runs again on every render (it's cheap), so a change to the prefix or a name takes effect straight away. Once file lists are cached, a page load makes one AllDebrid request, plus one more if new magnets have become ready. aria2 gets one request if anything has been sent.
 
@@ -146,9 +147,9 @@ Classification runs again on every render (it's cheap), so a change to the prefi
 3. Check aria2 with `aria2.getVersion`, so a wrong URL or secret doesn't use up unlock requests.
 4. Unlock each file's link, 100 ms apart to stay under AllDebrid's rate limit. If any unlock fails, stop and send nothing.
 5. Add them all to aria2 in one `system.multicall`.
-6. Record `Sent` (with each file's GID or error) or `Failed { error }`, then redirect back to the card.
+6. Record `Sent` (with each file's GID or error) or `Failed { error }`, then redirect back to the card on the page the form came from (its hidden `back` field, which must be a local path).
 
-The Send button is a plain form, so it works without JavaScript. A small script in `home.html` posts it with `fetch` instead: the button shows "Sending…" while the request runs, and the rest of the page stays usable. `fetch` follows the redirect, so the response is the updated home page. The script takes this magnet's card from it and swaps it in, so other cards keep whatever was typed in them. If the request fails, the card says so and asks you to reload.
+The Send button is a plain form, so it works without JavaScript. A small script in `magnets.html` posts it with `fetch` instead: the button shows "Sending…" while the request runs, and the rest of the page stays usable. `fetch` follows the redirect, so the response is the updated page. The script takes this magnet's card from it and swaps it in, so other cards keep whatever was typed in them. If the request fails, the card says so and asks you to reload.
 
 Once sent, the card hides the name form, since a new name couldn't change where the files are going.
 

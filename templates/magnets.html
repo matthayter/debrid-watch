@@ -1,10 +1,11 @@
 {% extends "base.html" %}
 
-{% block title %}Home{% endblock %}
-{% block nav_home %}class="active"{% endblock %}
+{% block title %}{% if latest %}Latest{% else %}Home{% endif %}{% endblock %}
+{% block nav_home %}{% if !latest %}class="active"{% endif %}{% endblock %}
+{% block nav_latest %}{% if latest %}class="active"{% endif %}{% endblock %}
 
 {% block content %}
-<h1>New magnets</h1>
+<h1>{% if latest %}New magnets{% else %}Magnets{% endif %}</h1>
 
 {% if !has_api_key %}
   <div class="card">
@@ -13,9 +14,18 @@
 {% else if let Some(error) = error %}
   <div class="notice error">Could not load magnets: {{ error }}</div>
 {% else if magnets.is_empty() %}
-  <div class="card muted">No new magnets yet (watching since {{ since_ago }}). Reload this page to check again.</div>
+  {% if latest %}
+    <div class="card muted">No new magnets yet (watching since {{ since_ago }}). Reload this page to check again.</div>
+  {% else %}
+    <div class="card muted">There are no magnets on this AllDebrid account.</div>
+  {% endif %}
 {% else %}
-  <p class="muted">Magnets added since watching started ({{ since_ago }}), newest first.</p>
+  {% if latest %}
+    <p class="muted">Magnets added since watching started ({{ since_ago }}), newest first.</p>
+  {% else %}
+    <p class="muted">Every magnet on the AllDebrid account, newest first.</p>
+  {% endif %}
+  {% include "pager.html" %}
   {% if let Some(e) = aria2_error %}
     <div class="notice error">Could not get download progress from aria2: {{ e }}</div>
   {% endif %}
@@ -41,6 +51,7 @@
     {% else %}
       {% if let Some(n) = m.media_name %}
         <form method="post" action="/magnets/{{ m.id }}/name" class="name-form">
+          <input type="hidden" name="back" value="{{ back }}">
           <label for="name-{{ m.id }}">{{ n.label }}</label>
           <div class="name-row">
             <input type="text" id="name-{{ m.id }}" name="name" value="{{ n.current }}" required>
@@ -68,6 +79,7 @@
         {% endif %}
         {% if aria2_configured %}
           <form method="post" action="/magnets/{{ m.id }}/send" class="send-form">
+            <input type="hidden" name="back" value="{{ back }}">
             <button type="submit">Send {{ m.send_count }} file{% if m.send_count != 1 %}s{% endif %} to aria2</button>
             <span class="hint">Check the destinations first. Each link is unlocked on AllDebrid, then added to aria2.</span>
           </form>
@@ -104,9 +116,10 @@
     {% endif %}
   </section>
   {% endfor %}
+  {% include "pager.html" %}
   <script>
     // Send in the background so the page stays usable while links unlock.
-    // The send route redirects to the home page, so the response holds the
+    // The send route redirects back to this page, so the response holds the
     // updated card, which replaces this one. Without JS the form posts normally.
     document.addEventListener("submit", async (e) => {
       const form = e.target.closest(".send-form");
@@ -119,7 +132,8 @@
       button.textContent = "Sending…";
       hint.textContent = "Unlocking links and adding them to aria2. This can take a while for big packs.";
       try {
-        const res = await fetch(form.action, { method: "POST" });
+        const body = new URLSearchParams(new FormData(form));
+        const res = await fetch(form.action, { method: "POST", body });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const page = new DOMParser().parseFromString(await res.text(), "text/html");
         const fresh = page.getElementById(card.id);

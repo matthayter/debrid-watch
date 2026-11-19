@@ -16,6 +16,9 @@ use crate::{
 /// Most magnet IDs sent in one `magnet/files` request.
 const FILES_BATCH_SIZE: usize = 50;
 
+/// Magnets per page on the home page.
+const PAGE_SIZE: usize = 10;
+
 /// Pause between `link/unlock` requests, to stay well under AllDebrid's
 /// limit of 12 requests per second.
 const UNLOCK_INTERVAL: Duration = Duration::from_millis(100);
@@ -23,28 +26,87 @@ const UNLOCK_INTERVAL: Duration = Duration::from_millis(100);
 /// Entry point for every HTTP request.
 pub fn handle(request: &Request, state: &AppState) -> Response {
     router!(request,
-        (GET) ["/"] => { home(state) },
+        (GET) ["/"] => { magnets_page(request, state, View::All) },
+        (GET) ["/latest"] => { magnets_page(request, state, View::Latest) },
         (GET) ["/settings"] => { settings_page(request, state) },
         (POST) ["/settings"] => { save_settings(request, state) },
         (POST) ["/magnets/{id}/name", id: u64] => { set_name(request, state, id) },
-        (POST) ["/magnets/{id}/send", id: u64] => { send_magnet(state, id) },
+        (POST) ["/magnets/{id}/send", id: u64] => { send_magnet(request, state, id) },
         _ => Response::empty_404()
     )
 }
 
-// ---------- Home ----------
+// ---------- Magnet lists ----------
+
+/// Which magnets a list page shows.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    /// Home: every magnet on the account, newest first, a page at a time.
+    All,
+    /// Latest: magnets added since `AppState::since`, all on one page.
+    Latest,
+}
 
 #[derive(Template)]
-#[template(path = "home.html")]
-struct HomeTemplate {
+#[template(path = "magnets.html")]
+struct MagnetsTemplate {
+    /// The Latest tab rather than the paged list of every magnet.
+    latest: bool,
+    /// This page's path, which its forms send so the reply comes back here.
+    back: String,
     has_api_key: bool,
     error: Option<String>,
     /// How long ago "new" starts, e.g. "5 min ago".
     since_ago: String,
+    /// Paging links, on the home page.
+    pager: Option<Pager>,
     aria2_configured: bool,
     /// Why download progress couldn't be fetched from aria2.
     aria2_error: Option<String>,
     magnets: Vec<MagnetCard>,
+}
+
+struct Pager {
+    /// Page shown, from 1.
+    page: usize,
+    /// Links to the newer and older pages, if there are any.
+    prev: Option<String>,
+    next: Option<String>,
+    /// Positions of the first and last magnets shown (from 1), and how many there are.
+    first: usize,
+    last: usize,
+    total: usize,
+}
+
+impl Pager {
+    /// Page `requested` of `total` items, clamped to the pages that exist.
+    fn new(total: usize, requested: usize, size: usize) -> Self {
+        let pages = total.div_ceil(size).max(1);
+        let page = requested.clamp(1, pages);
+        let start = (page - 1) * size;
+        Pager {
+            page,
+            prev: (page > 1).then(|| page_path(page - 1)),
+            next: (page < pages).then(|| page_path(page + 1)),
+            first: (start + 1).min(total),
+            last: (start + size).min(total),
+            total,
+        }
+    }
+
+    /// Indexes of this page's items.
+    fn range(&self) -> std::ops::Range<usize> {
+        self.first.saturating_sub(1)..self.last
+    }
+}
+
+/// Path of a page of the home list.
+fn page_path(page: usize) -> String {
+    if page <= 1 {
+        "/".to_string()
+    } else {
+        format!("/?page={page}")
+    }
 }
 
 struct MagnetCard {
@@ -104,15 +166,25 @@ struct FileRow {
 /// aria2's status for each GID, or why it couldn't be fetched (e.g. "GID not found").
 type Downloads = HashMap<String, Result<aria2::Status, String>>;
 
-fn home(state: &AppState) -> Response {
+fn magnets_page(request: &Request, state: &AppState, view: View) -> Response {
     // Copy the settings so the lock isn't held during HTTP requests.
     let s = settings(state).clone();
     let now = unix_now();
+    let requested_page = request
+        .get_param("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1);
 
-    let mut page = HomeTemplate {
+    let mut page = MagnetsTemplate {
+        latest: view == View::Latest,
+        back: match view {
+            View::All => page_path(requested_page),
+            View::Latest => "/latest".to_string(),
+        },
         has_api_key: s.alldebrid_api_key.is_some(),
         error: None,
         since_ago: format_ago(now - state.since),
+        pager: None,
         aria2_configured: s.aria2_url.is_some(),
         aria2_error: None,
         magnets: Vec::new(),
@@ -129,8 +201,17 @@ fn home(state: &AppState) -> Response {
             return render(&page);
         }
     };
-    magnets.retain(|m| m.upload_date >= state.since);
-    magnets.sort_by_key(|m| std::cmp::Reverse(m.upload_date));
+    // Newest first; the ID breaks ties so pages don't shuffle between loads.
+    magnets.sort_by_key(|m| std::cmp::Reverse((m.upload_date, m.id)));
+    match view {
+        View::All => {
+            let pager = Pager::new(magnets.len(), requested_page, PAGE_SIZE);
+            magnets = magnets.drain(pager.range()).collect();
+            page.back = page_path(pager.page);
+            page.pager = Some(pager);
+        }
+        View::Latest => magnets.retain(|m| m.upload_date >= state.since),
+    }
 
     let file_errors = fetch_missing_files(state, key, &magnets);
     let (downloads, aria2_error) = fetch_download_statuses(state, &s, &magnets);
@@ -468,6 +549,7 @@ fn set_name(request: &Request, state: &AppState, id: u64) -> Response {
     let form = match post_input!(request, {
         name: Option<String>,
         action: Option<String>,
+        back: Option<String>,
     }) {
         Ok(form) => form,
         Err(_) => return Response::text("Bad form data").with_status_code(400),
@@ -488,14 +570,15 @@ fn set_name(request: &Request, state: &AppState, id: u64) -> Response {
             overrides.remove(&id);
         }
     }
-    Response::redirect_303(format!("/#magnet-{id}"))
+    back_to_card(form.back.as_deref(), id)
 }
 
 // ---------- Sending to aria2 ----------
 
 /// Sends a magnet's included files to aria2, once.
-fn send_magnet(state: &AppState, id: u64) -> Response {
-    let back = Response::redirect_303(format!("/#magnet-{id}"));
+fn send_magnet(request: &Request, state: &AppState, id: u64) -> Response {
+    let form = post_input!(request, { back: Option<String> }).ok();
+    let back = back_to_card(form.and_then(|f| f.back).as_deref(), id);
 
     // Claim the magnet, so a double click or a second tab can't send it twice.
     {
@@ -748,6 +831,15 @@ fn settings_error(state: &AppState, error: String) -> Response {
 
 // ---------- Helpers ----------
 
+/// Redirects to a magnet's card on the page a form came from. `back` must be
+/// a path on this site; anything else goes to the home page.
+fn back_to_card(back: Option<&str>, id: u64) -> Response {
+    let path = back
+        .filter(|b| b.starts_with('/') && !b.starts_with("//") && !b.contains(['\\', '#']))
+        .unwrap_or("/");
+    Response::redirect_303(format!("{path}#magnet-{id}"))
+}
+
 /// Locks the settings.
 fn settings(state: &AppState) -> MutexGuard<'_, Settings> {
     lock(&state.settings)
@@ -846,6 +938,41 @@ mod tests {
     fn masks_key() {
         assert_eq!(mask_key("abcdefgh1234"), "••••••••1234");
         assert_eq!(mask_key("abcd"), "••••••••");
+    }
+
+    #[test]
+    fn pages() {
+        let link = |s: &str| Some(s.to_string());
+        let p = Pager::new(25, 1, 10);
+        assert_eq!((p.first, p.last, p.range()), (1, 10, 0..10));
+        assert_eq!((p.page, p.prev, p.next), (1, None, link("/?page=2")));
+        let p = Pager::new(25, 2, 10);
+        assert_eq!((p.prev, p.next), (link("/"), link("/?page=3")));
+        let p = Pager::new(25, 3, 10);
+        assert_eq!((p.first, p.last, p.range()), (21, 25, 20..25));
+        assert_eq!((p.page, p.prev, p.next), (3, link("/?page=2"), None));
+        let p = Pager::new(20, 2, 10);
+        assert_eq!((p.next, p.first, p.last), (None, 11, 20));
+        // Out-of-range pages show the nearest one.
+        assert_eq!(Pager::new(25, 9, 10).page, 3);
+        assert_eq!(Pager::new(25, 0, 10).page, 1);
+        let p = Pager::new(0, 1, 10);
+        assert_eq!((p.first, p.last, p.range()), (0, 0, 0..0));
+        assert_eq!((p.page, p.prev, p.next), (1, None, None));
+    }
+
+    #[test]
+    fn back_paths() {
+        let location = |back| {
+            let response = back_to_card(back, 7);
+            let (_, value) = response.headers.iter().find(|(k, _)| k == "Location").unwrap();
+            value.to_string()
+        };
+        assert_eq!(location(Some("/?page=2")), "/?page=2#magnet-7");
+        assert_eq!(location(Some("/latest")), "/latest#magnet-7");
+        assert_eq!(location(None), "/#magnet-7");
+        assert_eq!(location(Some("//evil.example")), "/#magnet-7");
+        assert_eq!(location(Some("https://evil.example")), "/#magnet-7");
     }
 
     #[test]

@@ -6,13 +6,13 @@ A small personal web server in Rust that shows magnets from an AllDebrid account
 - `src/alldebrid.rs`: AllDebrid API client. `src/aria2.rs`: aria2 JSON-RPC client. `src/web.rs`: routes and handlers. `src/main.rs`: startup and shared state.
 - Nix: `nix/package.nix` is the build recipe (callPackage), used by `flake.nix`, `default.nix` (non-flake) and `nix/module.nix` (NixOS module, `services.debrid-watch`, importable without flakes). Flakes only see git-tracked files, so `git add` new files before `nix build`.
 - `src/media.rs`: decides each file's destination (TV / movie / other) from file and folder names. Pure functions, unit-tested.
-- The home page shows magnets added since startup. File lists are fetched once per ready magnet and cached in memory. Users can override the detected show name or movie title per magnet (also in memory). A Send button unlocks the included files' links and adds them to aria2; what was sent is recorded in memory so it isn't sent twice.
+- The home page shows every magnet on the account, newest first, 10 per page (`?page=N`). The Latest tab (`/latest`) shows magnets added since startup. Forms post a hidden `back` path so they return to the page they came from. File lists are fetched once per ready magnet and cached in memory. Users can override the detected show name or movie title per magnet (also in memory). A Send button unlocks the included files' links and adds them to aria2; what was sent is recorded in memory so it isn't sent twice.
 - Env vars:
   - `ALLDEBRID_API_KEY`: optional starting key.
   - `DEBRID_WATCH_ADDR`: default `127.0.0.1:3000`.
   - `DEBRID_WATCH_DEST_PREFIX`: default `/downloads`.
   - `DEBRID_WATCH_ARIA2_URL`, `DEBRID_WATCH_ARIA2_SECRET`: optional aria2 RPC URL and secret.
-  - `DEBRID_WATCH_SINCE`: unix time to count magnets as new from; defaults to startup. `0` shows every existing magnet, which is useful for testing.
+  - `DEBRID_WATCH_SINCE`: unix time to count magnets as new from; defaults to startup. Only affects the Latest tab; `0` shows every existing magnet there, which is useful for testing.
 - `.env` (gitignored) holds the real API key. Load it with `set -a; . ./.env; set +a` and never print it.
 
 ## Testing

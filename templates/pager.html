@@ -1,0 +1,7 @@
+{% if let Some(p) = pager %}{% if p.prev.is_some() || p.next.is_some() %}
+  <nav class="pager">
+    {% if let Some(href) = p.prev %}<a href="{{ href }}">← Newer</a>{% else %}<span class="muted">← Newer</span>{% endif %}
+    <span class="muted">{{ p.first }}–{{ p.last }} of {{ p.total }}</span>
+    {% if let Some(href) = p.next %}<a href="{{ href }}">Older →</a>{% else %}<span class="muted">Older →</span>{% endif %}
+  </nav>
+{% endif %}{% endif %}
